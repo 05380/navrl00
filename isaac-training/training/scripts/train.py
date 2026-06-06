@@ -20,9 +20,8 @@ from torchrl.envs.utils import ExplorationType
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
-    OmegaConf.set_struct(cfg, False)
-    cfg.eval_task_mode = resolve_eval_style(cfg)
-    print(f"[NavRL]: eval_style={cfg.eval_style}, eval_task_mode={cfg.eval_task_mode}")
+    eval_task_mode, eval_label = resolve_eval_style(cfg)
+    print(f"[NavRL]: eval_style={cfg.eval_style}, eval_task_mode={eval_task_mode}")
 
     # Simulation App
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
@@ -105,18 +104,16 @@ def main(cfg):
         # Evaluate policy and log info
         if i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
-            env.enable_render(True)
-            env.eval()
+            eval_task_mode, eval_label = resolve_eval_style(cfg)
             eval_info = evaluate(
                 env=transformed_env, 
                 policy=policy,
                 seed=cfg.seed, 
                 cfg=cfg,
-                exploration_type=ExplorationType.MEAN
+                exploration_type=ExplorationType.MEAN,
+                prefix="eval",
+                eval_task_mode=eval_task_mode,
             )
-            env.enable_render(not cfg.headless)
-            env.train()
-            env.reset()
             info.update(eval_info)
             print("\n[NavRL]: evaluation done.")
         

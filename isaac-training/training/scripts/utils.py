@@ -9,16 +9,16 @@ from tensordict.tensordict import TensorDict
 from omni_drones.utils.torchrl import RenderCallback
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-def resolve_eval_style(cfg) -> str:
+def resolve_eval_style(cfg):
     eval_style = cfg.get("eval_style", "random_crossing_eval")
-    eval_task_modes = {
-        "random_crossing_eval": "random_crossing",
-        "standard_eval": "standard",
-    }
-    if eval_style not in eval_task_modes:
-        expected = ", ".join(eval_task_modes.keys())
-        raise ValueError(f"Unknown eval_style '{eval_style}'. Expected one of: {expected}.")
-    return eval_task_modes[eval_style]
+    eval_style = str(eval_style)
+    if eval_style in ("random_crossing_eval", "random_crossing"):
+        return "random_crossing", "random_crossing_eval"
+    if eval_style in ("standard_eval", "standard"):
+        return "standard", "standard_eval"
+    raise ValueError(
+        f"Unknown eval_style={eval_style}. Expected 'random_crossing_eval' or 'standard_eval'."
+    )
 
 def load_policy_checkpoint(policy, checkpoint_path, device, required: bool = False):
     if checkpoint_path is None:
@@ -204,10 +204,19 @@ def evaluate(
     policy,
     cfg,
     seed: int=0, 
-    exploration_type: ExplorationType=ExplorationType.MEAN
+    exploration_type: ExplorationType=ExplorationType.MEAN,
+    prefix: str="eval",
+    eval_task_mode: str=None,
 ):
+    base_env = getattr(env, "base_env", env)
+    prev_task_mode = getattr(base_env, "eval_task_mode", None)
+    prev_training = getattr(base_env, "training", None)
 
     env.enable_render(True)
+    if eval_task_mode is not None and hasattr(base_env, "set_eval_task_mode"):
+        base_env.set_eval_task_mode(eval_task_mode)
+    if hasattr(base_env, "eval"):
+        base_env.eval()
     env.eval()
     env.set_seed(seed)
 
@@ -222,10 +231,8 @@ def evaluate(
             break_when_any_done=False,
             return_contiguous=False,
         )
-    # base_env.enable_render(not cfg.headless)
     env.enable_render(not cfg.headless)
-    env.reset()
-    
+
     done = trajs.get(("next", "done")) 
     first_done = torch.argmax(done.long(), dim=1).cpu() # idx of first done will be return for each trajs
 
@@ -239,18 +246,30 @@ def evaluate(
     }
 
     info = {
-        "eval/stats." + k: torch.mean(v.float()).item() 
+        f"{prefix}/stats." + k: torch.mean(v.float()).item()
         for k, v in traj_stats.items()
     }
 
     # log video
-    info["recording"] = wandb.Video(
+    recording = wandb.Video(
         render_callback.get_video_array(axes="t c h w"), 
         fps=0.5 / (cfg.sim.dt * cfg.sim.substeps), 
         format="mp4"
     )
-    env.train()
-    # env.reset()
+    info[f"{prefix}/recording"] = recording
+    if prefix == "eval":
+        info["recording"] = recording
+
+    if prev_task_mode is not None and hasattr(base_env, "set_eval_task_mode"):
+        base_env.set_eval_task_mode(prev_task_mode)
+    if prev_training is not None:
+        if hasattr(base_env, "train"):
+            base_env.train(prev_training)
+        if hasattr(env, "train"):
+            env.train(prev_training)
+    else:
+        env.train()
+    env.reset()
 
     return info
 
