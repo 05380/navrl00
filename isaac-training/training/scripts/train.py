@@ -11,7 +11,7 @@ from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
 from torchrl.envs.transforms import TransformedEnv, Compose
-from utils import evaluate
+from utils import evaluate, load_policy_checkpoint, resolve_eval_style
 from torchrl.envs.utils import ExplorationType
 
 
@@ -20,6 +20,10 @@ from torchrl.envs.utils import ExplorationType
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
+    OmegaConf.set_struct(cfg, False)
+    cfg.eval_task_mode = resolve_eval_style(cfg)
+    print(f"[NavRL]: eval_style={cfg.eval_style}, eval_task_mode={cfg.eval_task_mode}")
+
     # Simulation App
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
@@ -58,10 +62,7 @@ def main(cfg):
     transformed_env.set_seed(cfg.seed)    
     # PPO Policy
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
-
-    # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
-    # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"
-    # policy.load_state_dict(torch.load(checkpoint))
+    load_policy_checkpoint(policy, cfg.checkpoint, cfg.device, required=False)
     
     # Episode Stats Collector
     episode_stats_keys = [
@@ -136,4 +137,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-    

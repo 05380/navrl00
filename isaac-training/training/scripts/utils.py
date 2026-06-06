@@ -2,10 +2,51 @@ import torch
 import torch.nn as nn
 import wandb
 import numpy as np
+import os
 from typing import Iterable, Union
+from hydra.utils import to_absolute_path
 from tensordict.tensordict import TensorDict
 from omni_drones.utils.torchrl import RenderCallback
 from torchrl.envs.utils import ExplorationType, set_exploration_type
+
+def resolve_eval_style(cfg) -> str:
+    eval_style = cfg.get("eval_style", "random_crossing_eval")
+    eval_task_modes = {
+        "random_crossing_eval": "random_crossing",
+        "standard_eval": "standard",
+    }
+    if eval_style not in eval_task_modes:
+        expected = ", ".join(eval_task_modes.keys())
+        raise ValueError(f"Unknown eval_style '{eval_style}'. Expected one of: {expected}.")
+    return eval_task_modes[eval_style]
+
+def load_policy_checkpoint(policy, checkpoint_path, device, required: bool = False):
+    if checkpoint_path is None:
+        if required:
+            raise ValueError("A checkpoint path is required. Pass checkpoint=/path/to/checkpoint.pt.")
+        return False
+
+    checkpoint_path = str(checkpoint_path)
+    if checkpoint_path == "":
+        if required:
+            raise ValueError("A checkpoint path is required. Pass checkpoint=/path/to/checkpoint.pt.")
+        return False
+
+    checkpoint_path = os.path.expanduser(checkpoint_path)
+    if not os.path.isabs(checkpoint_path):
+        checkpoint_path = to_absolute_path(checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "policy_state_dict" in checkpoint:
+        checkpoint = checkpoint["policy_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+
+    policy.load_state_dict(checkpoint)
+    print(f"[NavRL]: loaded checkpoint from {checkpoint_path}")
+    return True
 
 class ValueNorm(nn.Module):
     def __init__(
@@ -262,4 +303,3 @@ def construct_input(start, end):
     for n in range(start, end):
         input.append(f"{n}")
     return "(" + "|".join(input) + ")"
-

@@ -29,6 +29,16 @@ class NavigationEnv(IsaacEnv):
 
     def __init__(self, cfg):
         print("[Navigation Environment]: Initializing Env...")
+        self.eval_task_mode = cfg.get("eval_task_mode", "standard")
+        if self.eval_task_mode not in ("random_crossing", "standard"):
+            raise ValueError(
+                f"Unknown eval_task_mode '{self.eval_task_mode}'. "
+                "Expected one of: random_crossing, standard."
+            )
+        self.eval_boundary = float(cfg.get("eval_boundary", 24.0))
+        self.eval_static_clearance = float(cfg.get("eval_static_clearance", 0.8))
+        self.eval_height_range = (0.5, 2.5)
+
         # LiDAR params:
         self.lidar_range = cfg.sensor.lidar_range
         self.lidar_vfov = (max(-89., cfg.sensor.lidar_vfov[0]), min(89., cfg.sensor.lidar_vfov[1]))
@@ -136,7 +146,8 @@ class NavigationEnv(IsaacEnv):
             collision_group=-1,
             debug_vis=True,
         )
-        terrain_importer = TerrainImporter(terrain_cfg)
+        self.terrain_importer = TerrainImporter(terrain_cfg)
+        self._cache_static_obstacle_points()
 
         if (self.cfg.env_dyn.num_obstacles == 0):
             return
@@ -346,6 +357,86 @@ class NavigationEnv(IsaacEnv):
         self.info = info_spec.zero()
 
     
+    def _cache_static_obstacle_points(self):
+        terrain_mesh = self.terrain_importer.meshes.get("terrain")
+        if terrain_mesh is None:
+            self.static_obstacle_points_2d = torch.empty(0, 2, dtype=torch.float, device=self.device)
+            return
+
+        vertices = terrain_mesh.vertices
+        obstacle_vertices = vertices[vertices[:, 2] > 0.2]
+        if obstacle_vertices.size == 0:
+            self.static_obstacle_points_2d = torch.empty(0, 2, dtype=torch.float, device=self.device)
+            return
+
+        self.static_obstacle_points_2d = torch.as_tensor(
+            obstacle_vertices[:, :2],
+            dtype=torch.float,
+            device=self.device,
+        )
+
+    def _has_static_obstacle_clearance(self, pos_2d: torch.Tensor, clearance: float) -> torch.Tensor:
+        if self.static_obstacle_points_2d.numel() == 0:
+            return torch.ones(pos_2d.shape[0], dtype=torch.bool, device=self.device)
+
+        min_dist_sq = torch.full((pos_2d.shape[0],), float("inf"), dtype=torch.float, device=self.device)
+        for obstacle_points in torch.split(self.static_obstacle_points_2d, 8192):
+            dist_sq = torch.sum((pos_2d.unsqueeze(1) - obstacle_points.unsqueeze(0)) ** 2, dim=-1)
+            min_dist_sq = torch.minimum(min_dist_sq, torch.min(dist_sq, dim=1).values)
+        return min_dist_sq >= clearance ** 2
+
+    def _sample_boundary_positions(self, side_indices: torch.Tensor) -> torch.Tensor:
+        num_samples = side_indices.size(0)
+        boundary = self.eval_boundary
+        low_height, high_height = self.eval_height_range
+        positions = torch.empty(num_samples, 1, 3, dtype=torch.float, device=self.device)
+        positions[:, 0, :2] = 2.0 * boundary * torch.rand(num_samples, 2, dtype=torch.float, device=self.device) - boundary
+        positions[:, 0, 2] = low_height + torch.rand(num_samples, dtype=torch.float, device=self.device) * (high_height - low_height)
+
+        top = side_indices == 0
+        bottom = side_indices == 1
+        right = side_indices == 2
+        left = side_indices == 3
+        positions[top, 0, 1] = boundary
+        positions[bottom, 0, 1] = -boundary
+        positions[right, 0, 0] = boundary
+        positions[left, 0, 0] = -boundary
+        return positions
+
+    def _sample_clear_boundary_positions(self, side_indices: torch.Tensor) -> torch.Tensor:
+        positions = self._sample_boundary_positions(side_indices)
+        valid = torch.zeros(side_indices.size(0), dtype=torch.bool, device=self.device)
+
+        for _ in range(100):
+            invalid_indices = torch.nonzero(~valid, as_tuple=False).squeeze(-1)
+            if invalid_indices.numel() == 0:
+                break
+
+            candidates = self._sample_boundary_positions(side_indices[invalid_indices])
+            candidate_valid = self._has_static_obstacle_clearance(
+                candidates[:, 0, :2],
+                self.eval_static_clearance,
+            )
+            accepted_indices = invalid_indices[candidate_valid]
+            positions[accepted_indices] = candidates[candidate_valid]
+            valid[accepted_indices] = True
+
+        if not torch.all(valid):
+            invalid_indices = torch.nonzero(~valid, as_tuple=False).squeeze(-1)
+            positions[invalid_indices] = self._sample_boundary_positions(side_indices[invalid_indices])
+
+        return positions
+
+    def _sample_random_crossing_eval(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        num_resets = env_ids.size(0)
+        start_sides = torch.randint(0, 4, (num_resets,), dtype=torch.long, device=self.device)
+        target_side_offsets = torch.randint(1, 4, (num_resets,), dtype=torch.long, device=self.device)
+        target_sides = (start_sides + target_side_offsets) % 4
+
+        pos = self._sample_clear_boundary_positions(start_sides)
+        target_pos = self._sample_clear_boundary_positions(target_sides)
+        return pos, target_pos
+
     def reset_target(self, env_ids: torch.Tensor):
         if (self.training):
             # decide which side
@@ -369,15 +460,16 @@ class NavigationEnv(IsaacEnv):
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.    
         else:
-            self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
-            self.target_pos[:, 0, 1] = -24.
-            self.target_pos[:, 0, 2] = 2.            
+            target_x = torch.linspace(-0.5, 0.5, self.num_envs, dtype=torch.float, device=self.device) * 32.
+            self.target_pos[env_ids, 0, 0] = target_x[env_ids]
+            self.target_pos[env_ids, 0, 1] = -24.
+            self.target_pos[env_ids, 0, 2] = 2.
 
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
-        self.reset_target(env_ids)
         if (self.training):
+            self.reset_target(env_ids)
             masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
             shifts = torch.tensor([[0., 24., 0.], [0., -24., 0.], [24., 0., 0.], [-24., 0., 0.]], dtype=torch.float, device=self.device)
             mask_indices = np.random.randint(0, masks.size(0), size=env_ids.size(0))
@@ -394,7 +486,11 @@ class NavigationEnv(IsaacEnv):
             # pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
             # pos[:, 0, 1] = -24.
             # pos[:, 0, 2] = 2.
+        elif (self.eval_task_mode == "random_crossing"):
+            pos, target_pos = self._sample_random_crossing_eval(env_ids)
+            self.target_pos[env_ids] = target_pos
         else:
+            self.reset_target(env_ids)
             pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
             pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
             pos[:, 0, 1] = 24.

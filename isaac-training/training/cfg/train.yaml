@@ -11,6 +11,8 @@ seed: 0
 # Total Training Length
 max_frame_num: 12e8 # max frame 
 eval_interval: 1000 # evaluate the policy for every N training steps
+eval_style: random_crossing_eval # random_crossing_eval or standard_eval
+checkpoint: # path to an existing policy checkpoint for eval or resume training
 save_interval: 1000
 
 # Training Environment
