@@ -16,10 +16,24 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 
 def print_eval_metrics(eval_info, prefix="eval", label="eval"):
     metric_keys = [
+        f"{prefix}/success_rate",
+        f"{prefix}/collision_rate",
+        f"{prefix}/wall_collision_rate",
+        f"{prefix}/below_bound_rate",
+        f"{prefix}/above_bound_rate",
+        f"{prefix}/deadlock_rate",
+        f"{prefix}/deadlock_escape_success_rate",
+        f"{prefix}/conditioned/success_given_deadlock",
+        f"{prefix}/time_limit_rate",
+        f"{prefix}/deadlock_steps",
+        f"{prefix}/deadlock_step_ratio",
         f"{prefix}/stats.return",
         f"{prefix}/stats.episode_len",
         f"{prefix}/stats.reach_goal",
         f"{prefix}/stats.collision",
+        f"{prefix}/stats.wall_collision",
+        f"{prefix}/stats.stuck",
+        f"{prefix}/stats.stuck_steps",
         f"{prefix}/stats.truncated",
     ]
     metric_parts = []

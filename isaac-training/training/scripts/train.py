@@ -11,13 +11,38 @@ from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
 from torchrl.envs.transforms import TransformedEnv, Compose
-from utils import evaluate, load_policy_checkpoint, resolve_eval_style
+from utils import evaluate, load_policy_checkpoint, resolve_eval_style, summarize_episode_stats
 from torchrl.envs.utils import ExplorationType
 
 
 
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
+
+def print_metrics(info, prefix="eval", label="eval"):
+    metric_keys = [
+        f"{prefix}/success_rate",
+        f"{prefix}/collision_rate",
+        f"{prefix}/wall_collision_rate",
+        f"{prefix}/below_bound_rate",
+        f"{prefix}/above_bound_rate",
+        f"{prefix}/deadlock_rate",
+        f"{prefix}/deadlock_escape_success_rate",
+        f"{prefix}/conditioned/success_given_deadlock",
+        f"{prefix}/time_limit_rate",
+        f"{prefix}/deadlock_steps",
+        f"{prefix}/deadlock_step_ratio",
+        f"{prefix}/stats.return",
+        f"{prefix}/stats.episode_len",
+    ]
+    metric_parts = []
+    for key in metric_keys:
+        value = info.get(key)
+        if value is not None:
+            metric_parts.append(f"{key}={value:.4f}")
+    if metric_parts:
+        print(f"[NavRL]: {label} metrics | " + " | ".join(metric_parts))
+
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
     eval_task_mode, eval_label = resolve_eval_style(cfg)
@@ -95,11 +120,10 @@ def main(cfg):
         # Calculate and log training episode stats
         episode_stats.add(data)
         if len(episode_stats) >= transformed_env.num_envs: # evaluate once if all agents finished one episode
-            stats = {
-                "train/" + (".".join(k) if isinstance(k, tuple) else k): torch.mean(v.float()).item() 
-                for k, v in episode_stats.pop().items(True, True)
-            }
+            stats = summarize_episode_stats(episode_stats.pop(), prefix="train")
             info.update(stats)
+            if i % cfg.eval_interval == 0:
+                print_metrics(stats, prefix="train", label="train")
 
         # Evaluate policy and log info
         if i % cfg.eval_interval == 0:
@@ -115,6 +139,7 @@ def main(cfg):
                 eval_task_mode=eval_task_mode,
             )
             info.update(eval_info)
+            print_metrics(eval_info, prefix="eval", label=eval_label)
             print("\n[NavRL]: evaluation done.")
         
         # Update wand info

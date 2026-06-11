@@ -198,6 +198,136 @@ def make_batch(tensordict: TensorDict, num_minibatches: int):
     for indices in perm:
         yield tensordict[indices]
 
+def summarize_episode_stats(stats, prefix: str):
+    try:
+        stats_items = stats.items(True, True)
+    except TypeError:
+        stats_items = stats.items()
+
+    flat_stats = {}
+    for key, value in stats_items:
+        if isinstance(key, tuple):
+            key_parts = key[1:] if len(key) > 0 and key[0] == "stats" else key
+            name = ".".join(key_parts)
+        else:
+            name = key
+        flat_stats[name] = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+
+    info = {
+        f"{prefix}/stats.{k}": torch.mean(v.float()).item()
+        for k, v in flat_stats.items()
+    }
+
+    def mean_rate(mask: torch.Tensor):
+        return mask.float().mean().item()
+
+    def conditional_rate(event: torch.Tensor, condition: torch.Tensor):
+        condition = condition.bool()
+        return event[condition].float().mean().item() if condition.any() else 0.0
+
+    reach_goal = flat_stats.get("reach_goal")
+    collision = flat_stats.get("collision")
+    wall_collision = flat_stats.get("wall_collision")
+    below_bound = flat_stats.get("below_bound")
+    above_bound = flat_stats.get("above_bound")
+    truncated = flat_stats.get("truncated")
+    deadlock = flat_stats.get("stuck")
+    stuck_steps = flat_stats.get("stuck_steps")
+    episode_len = flat_stats.get("episode_len")
+
+    success_mask = None
+    failure_mask = None
+    collision_mask = None
+    deadlock_mask = None
+    time_limit_mask = None
+
+    if reach_goal is not None:
+        success_mask = reach_goal >= 0.5
+        if collision is not None:
+            success_mask = success_mask & (collision < 0.5)
+        if below_bound is not None:
+            success_mask = success_mask & (below_bound < 0.5)
+        if above_bound is not None:
+            success_mask = success_mask & (above_bound < 0.5)
+        failure_mask = ~success_mask
+        success_rate = mean_rate(success_mask)
+        info[f"{prefix}/success_rate"] = success_rate
+        info[f"{prefix}/failure_rate"] = mean_rate(failure_mask)
+        info[f"{prefix}/rates/success"] = success_rate
+        info[f"{prefix}/rates/failure"] = info[f"{prefix}/failure_rate"]
+
+    if collision is not None:
+        collision_mask = collision >= 0.5
+        collision_rate = mean_rate(collision_mask)
+        info[f"{prefix}/collision_rate"] = collision_rate
+        info[f"{prefix}/rates/collision"] = collision_rate
+
+    if wall_collision is not None:
+        wall_collision_mask = wall_collision >= 0.5
+        wall_collision_rate = mean_rate(wall_collision_mask)
+        info[f"{prefix}/wall_collision_rate"] = wall_collision_rate
+        info[f"{prefix}/rates/wall_collision"] = wall_collision_rate
+        if collision_mask is not None:
+            info[f"{prefix}/conditioned/wall_collision_given_collision"] = conditional_rate(
+                wall_collision_mask, collision_mask
+            )
+
+    if below_bound is not None:
+        below_bound_mask = below_bound >= 0.5
+        below_bound_rate = mean_rate(below_bound_mask)
+        info[f"{prefix}/below_bound_rate"] = below_bound_rate
+        info[f"{prefix}/rates/below_bound"] = below_bound_rate
+        if failure_mask is not None:
+            info[f"{prefix}/conditioned/below_bound_given_failure"] = conditional_rate(below_bound_mask, failure_mask)
+
+    if above_bound is not None:
+        above_bound_mask = above_bound >= 0.5
+        above_bound_rate = mean_rate(above_bound_mask)
+        info[f"{prefix}/above_bound_rate"] = above_bound_rate
+        info[f"{prefix}/rates/above_bound"] = above_bound_rate
+        if failure_mask is not None:
+            info[f"{prefix}/conditioned/above_bound_given_failure"] = conditional_rate(above_bound_mask, failure_mask)
+
+    if truncated is not None:
+        time_limit_mask = truncated >= 0.5
+        time_limit_rate = mean_rate(time_limit_mask)
+        info[f"{prefix}/time_limit_rate"] = time_limit_rate
+        info[f"{prefix}/rates/time_limit"] = time_limit_rate
+
+    if deadlock is not None:
+        deadlock_mask = deadlock >= 0.5
+        deadlock_rate = mean_rate(deadlock_mask)
+        info[f"{prefix}/deadlock_rate"] = deadlock_rate
+        info[f"{prefix}/rates/deadlock"] = deadlock_rate
+        if failure_mask is not None:
+            info[f"{prefix}/deadlock_rate_on_failure"] = conditional_rate(deadlock_mask, failure_mask)
+            info[f"{prefix}/conditioned/deadlock_given_failure"] = conditional_rate(deadlock_mask, failure_mask)
+        if collision_mask is not None:
+            info[f"{prefix}/conditioned/deadlock_given_collision"] = conditional_rate(deadlock_mask, collision_mask)
+        if time_limit_mask is not None:
+            info[f"{prefix}/conditioned/deadlock_given_time_limit"] = conditional_rate(deadlock_mask, time_limit_mask)
+
+    if stuck_steps is not None:
+        deadlock_steps = stuck_steps.float().mean().item()
+        info[f"{prefix}/deadlock_steps"] = deadlock_steps
+        info[f"{prefix}/deadlock/steps_mean"] = deadlock_steps
+        if episode_len is not None:
+            deadlock_step_ratio = (stuck_steps.float() / episode_len.float().clamp_min(1.0)).mean().item()
+            info[f"{prefix}/deadlock_step_ratio"] = deadlock_step_ratio
+            info[f"{prefix}/deadlock/step_ratio"] = deadlock_step_ratio
+
+    if success_mask is not None and deadlock_mask is not None:
+        success_given_deadlock = conditional_rate(success_mask, deadlock_mask)
+        info[f"{prefix}/conditioned/success_given_deadlock"] = success_given_deadlock
+        info[f"{prefix}/conditioned/success_given_no_deadlock"] = conditional_rate(success_mask, ~deadlock_mask)
+        info[f"{prefix}/deadlock_escape_success_rate"] = success_given_deadlock
+    if collision_mask is not None and deadlock_mask is not None:
+        info[f"{prefix}/conditioned/collision_given_deadlock"] = conditional_rate(collision_mask, deadlock_mask)
+    if time_limit_mask is not None and deadlock_mask is not None:
+        info[f"{prefix}/conditioned/time_limit_given_deadlock"] = conditional_rate(time_limit_mask, deadlock_mask)
+
+    return info
+
 @torch.no_grad()
 def evaluate(
     env,
@@ -245,10 +375,7 @@ def evaluate(
         for k, v in trajs[("next", "stats")].cpu().items()
     }
 
-    info = {
-        f"{prefix}/stats." + k: torch.mean(v.float()).item()
-        for k, v in traj_stats.items()
-    }
+    info = summarize_episode_stats(traj_stats, prefix=prefix)
 
     # log video
     recording = wandb.Video(

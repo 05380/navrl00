@@ -48,6 +48,12 @@ class NavigationEnv(IsaacEnv):
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
+        stuck_cfg = cfg.get("stuck", {})
+        self.stuck_window = max(1, int(stuck_cfg.get("window", 40)))
+        self.stuck_progress_eps = float(stuck_cfg.get("progress_eps", 0.005))
+        self.stuck_front_distance = min(self.lidar_range, float(stuck_cfg.get("front_obstacle_distance", 1.5)))
+        self.stuck_front_tan = float(np.tan(np.deg2rad(stuck_cfg.get("front_angle_deg", 35.0))))
+        self.stuck_front_height = float(stuck_cfg.get("front_height", 0.75))
 
         super().__init__(cfg, cfg.headless)
         
@@ -83,6 +89,8 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
+            self.prev_goal_distance = torch.zeros(self.num_envs, 1)
+            self.stuck_counter = torch.zeros(self.num_envs, 1, dtype=torch.long)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -304,6 +312,23 @@ class NavigationEnv(IsaacEnv):
 
         self.dyn_obs_step_count += 1
 
+    def _in_stuck_front_region(self, rel_pos, lateral_inflation=None, vertical_inflation=None):
+        forward = rel_pos[..., 0]
+        lateral = rel_pos[..., 1].abs()
+        vertical = rel_pos[..., 2].abs()
+        horizontal_distance = rel_pos[..., :2].norm(dim=-1)
+
+        if lateral_inflation is None:
+            lateral_inflation = 0.0
+        if vertical_inflation is None:
+            vertical_inflation = 0.0
+
+        return (
+            (forward > 0.0)
+            & (horizontal_distance <= self.stuck_front_distance + lateral_inflation)
+            & (lateral <= self.stuck_front_tan * forward.clamp_min(1e-6) + lateral_inflation)
+            & (vertical <= self.stuck_front_height + vertical_inflation)
+        )
 
     def _set_specs(self):
         observation_dim = 8
@@ -348,6 +373,12 @@ class NavigationEnv(IsaacEnv):
             "episode_len": UnboundedContinuousTensorSpec(1),
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
+            "wall_collision": UnboundedContinuousTensorSpec(1),
+            "below_bound": UnboundedContinuousTensorSpec(1),
+            "above_bound": UnboundedContinuousTensorSpec(1),
+            "stuck": UnboundedContinuousTensorSpec(1),
+            "stuck_active": UnboundedContinuousTensorSpec(1),
+            "stuck_steps": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
 
@@ -580,6 +611,8 @@ class NavigationEnv(IsaacEnv):
         self.drone.set_world_poses(pos, rot, env_ids)
         self.drone.set_velocities(self.init_vels[env_ids], env_ids)
         self.prev_drone_vel_w[env_ids] = 0.
+        self.prev_goal_distance[env_ids] = (self.target_pos[env_ids] - pos).norm(dim=-1)
+        self.stuck_counter[env_ids] = 0
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
@@ -632,9 +665,16 @@ class NavigationEnv(IsaacEnv):
         # b. unit direction vector to goal
         target_dir_2d = self.target_dir.clone()
         target_dir_2d[..., 2] = 0
+        stuck_dir_2d = rpos.clone()
+        stuck_dir_2d[..., 2] = 0
+        stuck_dir_2d = torch.where(stuck_dir_2d.norm(dim=-1, keepdim=True) > 1e-6, stuck_dir_2d, target_dir_2d)
 
         rpos_clipped = rpos / distance.clamp(1e-6) # unit vector: start to goal direction
         rpos_clipped_g = vec_to_new_frame(rpos_clipped, target_dir_2d) # express in the goal coodinate
+
+        lidar_hit_rpos_w = self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1)
+        lidar_hit_rpos_g = vec_to_new_frame(lidar_hit_rpos_w, stuck_dir_2d)
+        static_front_obstacle = self._in_stuck_front_region(lidar_hit_rpos_g).any(dim=1, keepdim=True)
         
         # c. velocity in the goal frame
         vel_w = self.root_state[..., 7:10] # world vel
@@ -651,6 +691,12 @@ class NavigationEnv(IsaacEnv):
             dyn_obs_pos_expanded = self.dyn_obs_state[..., :3].unsqueeze(0).repeat(self.num_envs, 1, 1)
             dyn_obs_rpos_expanded = dyn_obs_pos_expanded[..., :3] - self.root_state[..., :3] 
             dyn_obs_rpos_expanded[:, int(self.dyn_obs_state.size(0)/2):, 2] = 0.
+            dyn_obs_rpos_expanded_g_stuck = vec_to_new_frame(dyn_obs_rpos_expanded, stuck_dir_2d)
+            dynamic_front_obstacle = self._in_stuck_front_region(
+                dyn_obs_rpos_expanded_g_stuck,
+                lateral_inflation=self.dyn_obs_size[:, 0].unsqueeze(0) / 2.,
+                vertical_inflation=self.dyn_obs_size[:, 2].unsqueeze(0) / 2.,
+            ).any(dim=1, keepdim=True)
             dyn_obs_distance_2d = torch.norm(dyn_obs_rpos_expanded[..., :2], dim=2)  # Shape: (1000, 40). calculate 2d distance to each obstacle for all drones
             _, closest_dyn_obs_idx = torch.topk(dyn_obs_distance_2d, self.cfg.algo.feature_extractor.dyn_obs_num, dim=1, largest=False) # pick top N closest obstacle index
             dyn_obs_range_mask = dyn_obs_distance_2d.gather(1, closest_dyn_obs_idx) > self.lidar_range
@@ -701,6 +747,7 @@ class NavigationEnv(IsaacEnv):
         else:
             dyn_obs_states = torch.zeros(self.num_envs, 1, self.cfg.algo.feature_extractor.dyn_obs_num, 10, device=self.cfg.device)
             dynamic_collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.cfg.device)
+            dynamic_front_obstacle = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.cfg.device)
             
         # -----------------Network Input Final--------------
         obs = {
@@ -735,6 +782,7 @@ class NavigationEnv(IsaacEnv):
 
         # f. Collision condition with its penalty
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
+        wall_collision = static_collision
         collision = static_collision | dynamic_collision
         
         # Final reward calculation
@@ -747,7 +795,17 @@ class NavigationEnv(IsaacEnv):
         # self.reward[collision] -= 50. # collision
 
         # Terminate Conditions
-        reach_goal = (distance.squeeze(-1) < 0.5)
+        goal_distance = distance.squeeze(-1)
+        reach_goal = (goal_distance < 0.5)
+        goal_progress = self.prev_goal_distance - goal_distance
+        front_obstacle = static_front_obstacle | dynamic_front_obstacle
+        small_progress_with_obstacle = (goal_progress <= self.stuck_progress_eps) & front_obstacle & (~reach_goal)
+        self.stuck_counter = torch.where(
+            small_progress_with_obstacle,
+            self.stuck_counter + 1,
+            torch.zeros_like(self.stuck_counter),
+        )
+        stuck = self.stuck_counter >= self.stuck_window
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > 4.
         self.terminated = below_bound | above_bound | collision
@@ -755,12 +813,19 @@ class NavigationEnv(IsaacEnv):
 
         # update previous velocity for smoothness calculation in the next ieteration
         self.prev_drone_vel_w = self.drone.vel_w[..., :3].clone()
+        self.prev_goal_distance = goal_distance.clone()
 
         # # -----------------Training Stats-----------------
         self.stats["return"] += self.reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
-        self.stats["reach_goal"] = reach_goal.float()
-        self.stats["collision"] = collision.float()
+        self.stats["reach_goal"] = torch.maximum(self.stats["reach_goal"], reach_goal.float())
+        self.stats["collision"] = torch.maximum(self.stats["collision"], collision.float())
+        self.stats["wall_collision"] = torch.maximum(self.stats["wall_collision"], wall_collision.float())
+        self.stats["below_bound"] = torch.maximum(self.stats["below_bound"], below_bound.float())
+        self.stats["above_bound"] = torch.maximum(self.stats["above_bound"], above_bound.float())
+        self.stats["stuck"] = torch.maximum(self.stats["stuck"], stuck.float())
+        self.stats["stuck_active"] = stuck.float()
+        self.stats["stuck_steps"] += stuck.float()
         self.stats["truncated"] = self.truncated.float()
 
         return TensorDict({
